@@ -1,8 +1,10 @@
+"""
+PYTEST_DONT_REWRITE (prevents pytest from rewriting assertions, which interferes
+with test_adam in OptimizerTests)
+"""
 # Owner(s): ["module: dynamo"]
 
-import contextlib
 import inspect
-import unittest
 
 import torch
 
@@ -14,19 +16,6 @@ import torch._dynamo.testing
 input = torch.ones([10, 10])
 model = torch.nn.Sequential(*[torch.nn.Linear(10, 10) for _ in range(2)])
 model(input).sum().backward()
-
-
-# Include optimizer code for tracing
-optim_filenames = set(
-    [
-        inspect.getfile(obj)
-        for obj in torch.optim.__dict__.values()
-        if inspect.isclass(obj)
-    ]
-)
-
-
-optim_filenames |= {torch.optim._functional.__file__}
 
 
 def make_test(optim_cls, exp_graph_count=1, closure=None, **kwargs):
@@ -49,32 +38,7 @@ def make_test(optim_cls, exp_graph_count=1, closure=None, **kwargs):
     return test_fn
 
 
-@contextlib.contextmanager
-def enable_optimizer_tracing():
-    try:
-        old = set(torch._dynamo.skipfiles.FILENAME_ALLOWLIST)
-
-        torch._dynamo.skipfiles.FILENAME_ALLOWLIST.update(optim_filenames)
-        yield
-    finally:
-        torch._dynamo.skipfiles.FILENAME_ALLOWLIST.clear()
-        torch._dynamo.skipfiles.FILENAME_ALLOWLIST.update(old)
-
-
 class OptimizerTests(torch._dynamo.test_case.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-
-        # needed until pytorch assertion is changed to enable Adam
-        # to be called with capturable=True
-        cls._exit_stack.enter_context(
-            unittest.mock.patch.object(
-                torch._dynamo.config, "capture_scalar_outputs", True
-            )
-        )
-        cls._exit_stack.enter_context(enable_optimizer_tracing())
-
     test_sgd = make_test(torch.optim.SGD, lr=0.01)
     # lgbfs has data-dependent control and internally iterates
     # calling the closure
@@ -93,15 +57,13 @@ class OptimizerTests(torch._dynamo.test_case.TestCase):
 
 # exclude SparseAdam because other areas of the stack don't support it yet
 # the others are handled specially above
-exclude = set(
-    [
-        "SGD",  # Handled above
-        "Optimizer",
-        "SparseAdam",  # Unsupported
-        "LBFGS",  # Unsupported
-        "RAdam",  # Has data dependent control for rectification (needs symint)
-    ]
-)
+exclude = {
+    "SGD",  # Handled above
+    "Optimizer",
+    "SparseAdam",  # Unsupported
+    "LBFGS",  # Unsupported
+    "RAdam",  # Has data dependent control for rectification (needs symint)
+}
 
 optimizers = [
     opt
@@ -117,17 +79,9 @@ for opt in optimizers:
 
 
 class End2EndTests(torch._dynamo.test_case.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls._exit_stack.enter_context(enable_optimizer_tracing())
-
     # https://github.com/pytorch/torchdynamo/issues/1604
     def test_optimizing_over_tensor_with_requires_grad(self):
         class Net(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-
             def forward(self, x, y):
                 z = torch.bmm(x, y)
                 z = torch.flatten(z, 1)

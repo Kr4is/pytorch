@@ -1,20 +1,26 @@
-import collections
 import contextlib
 import itertools
 import logging
-import math
 import re
-import textwrap
 import typing
 from collections import namedtuple
-from io import StringIO
 from itertools import chain
 
 import sympy
 from sympy.printing.printer import Printer
 
+import torch
+
 from .. import metrics
-from ..utils import free_symbol_startswith, sympy_dot, sympy_subs, sympy_symbol, unique
+from ..utils import (
+    DeferredLineBase,
+    free_symbol_startswith,
+    IndentedBuffer,
+    sympy_dot,
+    sympy_subs,
+    sympy_symbol,
+    unique,
+)
 from ..virtualized import ops, V
 
 log = logging.getLogger(__name__)
@@ -33,6 +39,20 @@ def index_prevent_reordering(index: typing.List[sympy.Expr], index_vars, sizes):
 class ExprPrinter(Printer):
     @staticmethod
     def paren(string):
+        def all_in_parens(string):
+            if string[0] != "(" or len(string) < 2:
+                return False
+            count = 1
+            for i, char in enumerate(string[1:]):
+                if char == "(":
+                    count += 1
+                elif char == ")":
+                    count -= 1
+                if count == 0 and i != len(string) - 2:
+                    return False
+            assert count == 0
+            return True
+
         if (
             isinstance(string, CSEVariable)
             or re.match(r"^[a-z0-9_.]+$", string, re.I)
@@ -40,12 +60,20 @@ class ExprPrinter(Printer):
             or string == ""
         ):
             return string
+        # don't put extra parens for strings that are already wrapped in parens
+        if all_in_parens(string):
+            return string
         return f"({string})"
 
     def _print_Pow(self, expr):
         # Pow() confuses triton
         base, exp = expr.args
         base = self._print(base)
+        # NB: Remember this is sizevar computation!  You don't typically
+        # expect to have to do floating point computation including exponents
+        # in sizevar compute.  Instead of adding support for sqrt/floating
+        # point pow, you should make upstream retranslate the Sympy expression
+        # into Tensor expressions earlier and do that instead.
         assert exp.is_integer
         exp = int(exp)
         if exp > 0:
@@ -65,7 +93,32 @@ class ExprPrinter(Printer):
         return " % ".join(map(self.paren, map(self._print, expr.args)))
 
     def _print_CleanDiv(self, expr):
-        return self._print_IndexingDiv(expr)
+        return self._print_FloorDiv(expr)
+
+
+class PythonPrinter(ExprPrinter):
+    def _print_ModularIndexing(self, expr):
+        x, div, mod = expr.args
+        x = self.paren(self.doprint(x))
+        div = self.paren(self.doprint(div))
+        mod = self.paren(self.doprint(mod))
+        if div != "1":
+            x = f"({x} // {div})"
+        return f"{x} % {mod}"
+
+    def _print_FloorDiv(self, expr):
+        x, div = expr.args
+        x = self.paren(self.doprint(x))
+        div = self.paren(self.doprint(div))
+        return f"({x} // {div})"
+
+    def _print_floor(self, expr):
+        assert len(expr.args) == 1
+        return f"math.floor({self._print(expr.args[0])})"
+
+    def _print_ceiling(self, expr):
+        assert len(expr.args) == 1
+        return f"math.ceil({self._print(expr.args[0])})"
 
 
 class OpOverrides:
@@ -120,107 +173,27 @@ class OpOverrides:
         return f"{ExprPrinter.paren(x)} ^ {ExprPrinter.paren(y)}"
 
     @staticmethod
+    def bitwise_left_shift(x, y):
+        return f"{ExprPrinter.paren(x)} << {ExprPrinter.paren(y)}"
+
+    # TODO(fdrocha): this is currently not being used anywhere,
+    # pending on moving triton pin past 972b761
+    @staticmethod
+    def bitwise_right_shift(x, y):
+        return f"{ExprPrinter.paren(x)} >> {ExprPrinter.paren(y)}"
+
+    @staticmethod
     def remainder(a, b):
         r = ops.mod(a, b)
         return ops.where(f"(({r} != 0) & (({r} < 0) != ({b} < 0)))", ops.add(r, b), r)
 
 
-class IndentedBuffer:
-    tabwidth = 4
-
-    def __init__(self, initial_indent=0):
-        self._lines = []
-        self._indent = initial_indent
-
-    def getvalue(
-        self,
-    ):
-        buf = StringIO()
-        for line in self._lines:
-            if isinstance(line, DeferredLine):
-                line = line()
-                if line is None:
-                    continue
-            assert isinstance(line, str)
-            buf.write(line)
-            buf.write("\n")
-        return buf.getvalue()
-
-    def getrawvalue(self):
-        buf = StringIO()
-        for line in self._lines:
-            if isinstance(line, DeferredLine):
-                line = line()
-                if line is None:
-                    continue
-            assert isinstance(line, str)
-            # backslash implies line continuation
-            if line.endswith("\\"):
-                buf.write(line[:-1])
-            else:
-                buf.write(line)
-                buf.write("\n")
-        return buf.getvalue()
-
-    def clear(self):
-        self._lines.clear()
-
-    def __bool__(self):
-        return bool(self._lines)
-
-    def prefix(self):
-        return " " * (self._indent * self.tabwidth)
-
-    def writeline(self, line):
-        if isinstance(line, DeferredLine):
-            self._lines.append(line.with_prefix(self.prefix()))
-        elif line.strip():
-            self._lines.append(f"{self.prefix()}{line}")
-        else:
-            self._lines.append("")
-
-    def writelines(self, lines):
-        for line in lines:
-            self.writeline(line)
-
-    def indent(self, offset=1):
-        @contextlib.contextmanager
-        def ctx():
-            self._indent += offset
-            yield
-            self._indent -= offset
-
-        return ctx()
-
-    def splice(self, other_code, strip=False):
-        if isinstance(other_code, IndentedBuffer):
-            dedent = float("inf")
-            for line in other_code._lines:
-                if line:
-                    dedent = min(dedent, len(line) - len(line.lstrip()))
-            if math.isinf(dedent):
-                dedent = 0
-            for line in other_code._lines:
-                IndentedBuffer.writeline(self, line[dedent:])
-        else:
-            other_code = textwrap.dedent(other_code)
-            if strip:
-                other_code = other_code.lstrip()
-            if not other_code:
-                return
-            other_code = other_code.rstrip()
-            for line in other_code.split("\n"):
-                self.writeline(line)
-
-
-class DeferredLine:
+class DeferredLine(DeferredLineBase):
     """A line that can be 'unwritten' by adding name to V.graph.removed_buffers"""
 
     def __init__(self, name, line):
-        if not line.strip():
-            line = ""
+        super().__init__(line)
         self.name = name
-        self.line = line
 
     def __call__(self):
         if (
@@ -230,35 +203,8 @@ class DeferredLine:
             return self.line
         return None
 
-    def with_prefix(self, prefix):
-        return DeferredLine(self.name, f"{prefix}{self.line}")
-
-    def lstrip(self):
-        return DeferredLine(self.name, self.line.lstrip())
-
-    def __getitem__(self, index):
-        return DeferredLine(self.name, self.line[index])
-
-    def __bool__(self):
-        return bool(self.line)
-
-    def __len__(self):
-        return len(self.line)
-
-
-class DeferredIndentedBuffer(IndentedBuffer):
-    def __init__(self, initial_indent=0):
-        super(DeferredIndentedBuffer, self).__init__(initial_indent)
-
-    def writeline(self, name, line):
-        if name is None:
-            return super().writeline(line)
-        assert "buf" in name
-        return super().writeline(DeferredLine(name, line))
-
-    def writelines(self, name, lines):
-        for line in lines:
-            self.writeline(name, line)
+    def _new_line(self, line):
+        return DeferredLine(self.name, line)
 
 
 class BracesBuffer(IndentedBuffer):
@@ -291,19 +237,34 @@ class KernelArgs:
     @staticmethod
     def _lookup(prefix, odict, name):
         assert isinstance(name, (str, sympy.Symbol))
-        name = str(name)
         if name not in odict:
             odict[name] = f"{prefix}{len(odict)}"
         return odict[name]
 
     def __init__(self, sizevars=None):
-        self.input_buffers = collections.OrderedDict()
-        self.output_buffers = collections.OrderedDict()
-        self.inplace_buffers = collections.OrderedDict()
-        self.sizevars = sizevars or collections.OrderedDict()
+        self.input_buffers = dict()
+        self.output_buffers = dict()
+        self.inplace_buffers = dict()
+        self.sizevars = sizevars or dict()
+
+    def __repr__(self):
+        return "KernelArgs({})".format(
+            ", ".join(
+                map(
+                    repr,
+                    [
+                        self.input_buffers,
+                        self.output_buffers,
+                        self.inplace_buffers,
+                        self.sizevars,
+                    ],
+                )
+            )
+        )
 
     def input(self, name):
-        name = V.graph.scheduler.mutation_real_name.get(name, name)
+        if V.graph.scheduler:
+            name = V.graph.scheduler.mutation_real_name.get(name, name)
         assert name not in V.graph.removed_buffers, name
         if name in self.output_buffers:
             return self.output_buffers[name]
@@ -314,7 +275,8 @@ class KernelArgs:
         return self._lookup("in_ptr", self.input_buffers, name)
 
     def output(self, name):
-        name = V.graph.scheduler.mutation_real_name.get(name, name)
+        if V.graph.scheduler:
+            name = V.graph.scheduler.mutation_real_name.get(name, name)
         assert name not in V.graph.removed_buffers, name
         if name in self.inplace_buffers:
             return self.inplace_buffers[name].inner_name
@@ -356,9 +318,14 @@ class KernelArgs:
 
         # TODO(jansel): replace this with data from scheduler
         buffer_types = {x.get_name(): x.get_dtype() for x in V.graph.buffers}
-        buffer_types.update(
-            {name: val.get_dtype() for name, val in V.graph.graph_inputs.items()}
-        )
+        for name, val in V.graph.graph_inputs.items():
+            if isinstance(val, sympy.Expr):
+                if val.is_integer:
+                    buffer_types[name] = torch.int64
+                else:
+                    buffer_types[name] = torch.float64
+            else:
+                buffer_types[name] = val.get_dtype()
         buffer_types.update(
             {name: val.dtype for name, val in V.graph.constants.items()}
         )
@@ -371,7 +338,7 @@ class KernelArgs:
             inner = inplaced.inner_name
             dtype = buffer_types[outer]
             cpp_dtype = DTYPE_TO_CPP[dtype]
-            arg_defs.append(f"{cpp_dtype}* __restrict__ {inner}")
+            arg_defs.append(f"{cpp_dtype}* {inner}")
             call_args.append(self.wrap_ptr_arg(outer, dtype))
             arg_types.append(f"{cpp_dtype}*")
         for outer, inner in self.input_buffers.items():
@@ -379,7 +346,7 @@ class KernelArgs:
                 continue
             dtype = buffer_types[outer]
             cpp_dtype = DTYPE_TO_CPP[dtype]
-            arg_defs.append(f"const {cpp_dtype}* __restrict__ {inner}")
+            arg_defs.append(f"const {cpp_dtype}* {inner}")
             call_args.append(self.wrap_ptr_arg(outer, dtype))
             arg_types.append(f"const {cpp_dtype}*")
         for outer, inner in self.output_buffers.items():
@@ -387,7 +354,7 @@ class KernelArgs:
                 continue
             dtype = buffer_types[outer]
             cpp_dtype = DTYPE_TO_CPP[dtype]
-            arg_defs.append(f"{cpp_dtype}* __restrict__ {inner}")
+            arg_defs.append(f"{cpp_dtype}* {inner}")
             call_args.append(self.wrap_ptr_arg(outer, dtype))
             arg_types.append(f"{cpp_dtype}*")
         for outer, inner in self.sizevars.items():
@@ -420,8 +387,9 @@ class KernelArgs:
             precompile_args.append(TensorArg(inner, outer, V.graph.get_dtype(outer)))
         for outer, inner in self.sizevars.items():
             arg_defs.append(inner)
-            call_args.append(outer)
-            precompile_args.append(SizeArg(inner, sympy_symbol(outer)))
+            call_args.append(str(outer))
+            precompile_args.append(SizeArg(inner, outer))
+
         return arg_defs, call_args, precompile_args
 
     def aliases(self):
@@ -446,7 +414,8 @@ class KernelArgs:
 class CSEVariable:
     """A CSEVariable is just a name for an expression but it is useful to be able to annotate them on a backend dependent basis.
     The backends can inherit from this class and overload the "create_cse_var" Kernel to do that.
-    The "update_on_args" method gives you a hook for annotations, see example of TritonCSEVariable in triton.py."""
+    The "update_on_args" method gives you a hook for annotations, see example of TritonCSEVariable in triton.py.
+    """
 
     def __init__(self, name):
         self.name = name
@@ -460,7 +429,7 @@ class CSEVariable:
     def __eq__(self, other) -> bool:
         return type(other) == type(self) and other.name == self.name
 
-    def update_on_args(self, args, kwargs):
+    def update_on_args(self, name, args, kwargs):
         pass
 
 
@@ -485,6 +454,7 @@ class CSE:
         iter_buffers=None,
         store_cache=None,
         reduction_cache=None,
+        varname_map=None,
     ):
         self.prefix = prefix
         self.suffix = suffix
@@ -494,7 +464,7 @@ class CSE:
         self.reduction_cache = reduction_cache or {}
         self.iter_buffer_ids = iter_buffers or itertools.count()
         self.invalidated_stores = set()
-        self.varname_map = {}
+        self.varname_map = varname_map or {}
 
     def invalidate(self, keep_vars: typing.Set[str]):
         for name, tmp in list(self.store_cache.items()):
@@ -504,27 +474,37 @@ class CSE:
         self.cache = {k: v for k, v in self.cache.items() if v in keep_vars}
 
     def clone(self):
+        # Note(fdrocha): reduction_cache is not being cloned, not sure if this is intentional
         return CSE(
-            self.prefix,
-            self.suffix,
-            self.name_prefix,
-            self.iter_buffer_ids,
-            self.store_cache,
+            prefix=self.prefix,
+            suffix=self.suffix,
+            name_prefix=self.name_prefix,
+            iter_buffers=self.iter_buffer_ids,
+            store_cache=self.store_cache,
+            varname_map=self.varname_map,
         )
 
     def generate(
-        self, buffer: IndentedBuffer, expr: typing.Union[str, CSEVariable], write=True
+        self,
+        buffer: IndentedBuffer,
+        expr: typing.Union[str, CSEVariable],
+        write=True,
     ) -> CSEVariable:
         assert isinstance(expr, (str, CSEVariable)), type(expr)
         if isinstance(expr, CSEVariable):
             return expr
-        if expr not in self.cache:
+        cache_key = expr
+        if cache_key not in self.cache:
             var = self.newvar()
-            self.cache[expr] = var
+            self.cache[cache_key] = var
             if write:
-                V.kernel.current_node.codegen_originating_info(buffer, only_once=True)
+                if V.kernel.current_node:
+                    V.kernel.current_node.codegen_originating_info(
+                        buffer, only_once=True
+                    )
                 buffer.writeline(f"{self.prefix}{var} = {expr}{self.suffix}")
-        return self.cache[expr]
+
+        return self.cache[cache_key]
 
     def newvar(self) -> CSEVariable:
         var_name = f"{self.name_prefix}{next(self.iter_buffer_ids)}"
@@ -559,7 +539,7 @@ class Kernel(CodeGen):
         self.args = args or KernelArgs()
         self.loads = IndentedBuffer()
         self.compute = IndentedBuffer()
-        self.stores = DeferredIndentedBuffer()
+        self.stores = IndentedBuffer()
         self.cse = CSE(self.newvar_prefix, self.suffix)
         self.must_keep_buffers = set()
         self.current_node = None
@@ -569,8 +549,10 @@ class Kernel(CodeGen):
     def set_current_node(self, node):
         prior = self.current_node
         self.current_node = node
-        yield
-        self.current_node = prior
+        try:
+            yield
+        finally:
+            self.current_node = prior
 
     @contextlib.contextmanager
     def swap_buffers(self, lb, cb=None, sb=None):
@@ -584,11 +566,13 @@ class Kernel(CodeGen):
         self.compute = cb
         self.stores = sb
         self.cse = cse.clone()
-        yield
-        self.loads = loads
-        self.compute = compute
-        self.stores = stores
-        self.cse = cse
+        try:
+            yield
+        finally:
+            self.loads = loads
+            self.compute = compute
+            self.stores = stores
+            self.cse = cse
 
     def load(self, name: str, index: sympy.Expr):
         raise NotImplementedError()
@@ -611,13 +595,15 @@ class Kernel(CodeGen):
 
     def __enter__(self):
         class CSEProxy:
+            self.name = "CSEProxy"
+
             @staticmethod
             def __getattr__(name):
                 def inner(*args, **kwargs):
                     csevar = self.cse.generate(
                         self.compute, getattr(parent_handler, name)(*args, **kwargs)
                     )
-                    csevar.update_on_args(args, kwargs)
+                    csevar.update_on_args(name, args, kwargs)
                     return csevar
 
                 return inner
@@ -644,8 +630,9 @@ class Kernel(CodeGen):
                 self.store_buffer_names.add(name)
                 if mode is None:
                     self.cse.store_cache[name] = value
-                    for other_name in self.current_node.get_mutations():
-                        self.cse.store_cache[other_name] = value
+                    if self.current_node:
+                        for other_name in self.current_node.get_mutations():
+                            self.cse.store_cache[other_name] = value
                 if name not in V.graph.removed_buffers:
                     return self.store(name, index, value, mode=mode)
 
@@ -663,16 +650,21 @@ class Kernel(CodeGen):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        V.graph.scheduler.remove_kernel_local_buffers()
+        if V.graph.scheduler:
+            V.graph.scheduler.remove_kernel_local_buffers()
         super().__exit__(exc_type, exc_val, exc_tb)
 
     def rename_indexing(self, index) -> sympy.Expr:
+        # adds the necessary kernel args for index expressions
+        # and renames variables in index expressions to kernel arg names
         if isinstance(index, (list, tuple)):
             return [self.rename_indexing(x) for x in index]
         index = V.graph.sizevars.simplify(index)
         sorted_symbols = sorted(index.free_symbols, key=lambda s: s.name)
         replacements = {
-            x: self.args.size(x) for x in sorted_symbols if x.name.startswith("s")
+            x: self.args.size(x)
+            for x in sorted_symbols
+            if x.name.startswith("s") or x.name.startswith("ps")
         }
         return sympy_subs(index, replacements)
 

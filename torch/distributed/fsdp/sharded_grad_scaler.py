@@ -9,6 +9,8 @@ from torch.cuda.amp.grad_scaler import _MultiDeviceReplicator, GradScaler, OptSt
 from torch.distributed.distributed_c10d import ProcessGroup
 from torch.optim.sgd import SGD
 
+log = logging.getLogger(__name__)
+
 
 def _refresh_per_optimizer_state():
     return {"stage": OptState.READY, "found_inf_per_device": {}}
@@ -34,7 +36,7 @@ class ShardedGradScaler(GradScaler):
     """
     ShardedGradScaler helps perform gradient scaling in a shard aware manner. It extends
     functionality from GradScaler:
-    * Suports Pytorch DDP and FSDP implementations
+    * Supports Pytorch DDP and FSDP implementations
     * Support CPU offloaded tensors (as used in fully sharded data parallel[FSDP])
     * Supports the custom Mixed Precision loss dtype (fp16, bf16) that FSDP returns
     * Sync inf/nan for scaled gradient tensors on any torch.device (where tensors are placed) across
@@ -158,9 +160,10 @@ class ShardedGradScaler(GradScaler):
         for grad in grads:
             for tensor in grad:
                 if tensor.device != expected_device:
-                    logging.error(
-                        "tensor device is %s and expected device is %s"
-                        % (tensor.device, expected_device)
+                    log.error(
+                        "tensor device is %s and expected device is %s",
+                        tensor.device,
+                        expected_device,
                     )
                     raise ValueError("Gradients must be on the same device.")
 
@@ -206,7 +209,7 @@ class ShardedGradScaler(GradScaler):
                         # For scaled fp16 values, there's a good chance coalescing will cause overflow,
                         # so we should check the coalesced _values().
                         if param.grad.dtype is torch.float16:
-                            # coalesce is not suported in torch.float16
+                            # coalesce is not supported in torch.float16
                             param_grad_fp32 = param.grad.type(torch.float32).coalesce()
                             param.grad = param_grad_fp32.type(torch.float16)
                         to_unscale = param.grad._values()

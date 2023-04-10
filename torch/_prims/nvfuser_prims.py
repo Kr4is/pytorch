@@ -143,7 +143,12 @@ _nvfuser_unary_ops = {
 
 def _assert_nvfuser_op_exists(fname: str):
     try:
-        from torch._C._nvfuser import FusionDefinition as fd  # type: ignore[import]
+        try:
+            from nvfuser import (  # type: ignore[import, attr-defined]
+                FusionDefinition as fd,
+            )
+        except ImportError:
+            from nvfuser._C import FusionDefinition as fd  # type: ignore[import]
 
         assert getattr(fd.Operators, fname)
     except ImportError:
@@ -218,7 +223,6 @@ _nvfuser_impls["{fname}"] = _{fname}_nvfuser
 def _native_batch_norm_nvfuser(
     fd, input, weight, bias, running_mean, running_var, training, momentum, eps
 ):
-
     """
     if weight is None:
         weight = fd.define_null_tensor()
@@ -260,7 +264,7 @@ def _transpose_nvfuser(fd, a, dims):
 
 
 def _squeeze_nvfuser(fd, a, a_shape, dimensions):
-    for idx in reversed(sorted(dimensions)):
+    for idx in sorted(dimensions, reverse=True):
         a = fd.ops.squeeze(a, a_shape, idx)
         a_shape = a_shape[:idx] + a_shape[idx + 1 :]
     return a
@@ -276,7 +280,10 @@ def _view_nvfuser(
     a_shape,
     new_shape,
 ):
-    return fd.ops.view(a, a_shape, new_shape)
+    try:
+        return fd.ops.view(a, a_shape, new_shape)
+    except AttributeError:
+        return fd.ops.reshape(a, a_shape, new_shape)
 
 
 def _sum_nvfuser(
@@ -285,7 +292,12 @@ def _sum_nvfuser(
     dims: DimsSequenceType,
 ):
     keep_dims = False
-    output_dtype = torch._C._nvfuser.DataType.Null
+    try:
+        from nvfuser import DataType  # type: ignore[import, attr-defined]
+    except ImportError:
+        from nvfuser._C import DataType  # type: ignore[import]
+
+    output_dtype = DataType.Null
     return fd.ops.sum(a, dims, keep_dims, output_dtype)
 
 
@@ -294,7 +306,7 @@ def _var_nvfuser(
     a: TensorLikeType,
     dims: DimsSequenceType,
     *,
-    correction: int,
+    correction: float,
 ):
     keep_dims = False
     return fd.ops.var(a, dims, correction, keep_dims)
@@ -307,7 +319,7 @@ def _var_mean_nvfuser(
     unbiased: Optional[bool] = None,
     keepdim: bool = False,
     *,
-    correction: int,
+    correction: float,
 ):
     # Unbiased arg shouldn't be set when this function is called
     assert unbiased is None
@@ -396,6 +408,7 @@ def register_full():
         dtype=None,
         layout=None,
         device=None,
+        pin_memory=False,
         requires_grad=False,
     ):
         strides = make_contiguous_strides_for(size)
@@ -432,7 +445,7 @@ def register_full():
     nvprim_impl.impl(name, _prim_impl)
     nvprim_meta_impl.impl(name, _meta_impl)
 
-    prim_packet = getattr(torch.ops.nvprims, name)
+    prim_packet = getattr(torch._ops.ops.nvprims, name)
     prim = prim_packet.default
     nvprim_autograd_impl.impl(name, backwards_not_supported(prim))
     for p in (prim_packet, prim):
@@ -538,7 +551,7 @@ def register_native_batch_norm():
         )
 
     nvprim_impl.impl(name, _prim_impl)
-    prim_packet = torch.ops.nvprims.native_batch_norm
+    prim_packet = torch._ops.ops.nvprims.native_batch_norm
     prim = prim_packet.default
 
     def _native_batch_norm_ref(
@@ -551,7 +564,6 @@ def register_native_batch_norm():
         momentum: float,
         eps: float,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
         if torch._prims_common.is_complex_dtype(input.dtype):
             raise NotImplementedError("Complex tensors are not supported")
 
@@ -646,7 +658,7 @@ def register_rand_like():
     nvprim_impl.impl(name, _prim_impl)
     nvprim_meta_impl.impl(name, _meta_rand_like)
 
-    prim_packet = getattr(torch.ops.nvprims, name)
+    prim_packet = getattr(torch._ops.ops.nvprims, name)
     prim = prim_packet.default
 
     nvprim_autograd_impl.impl(name, backwards_not_supported(prim))
@@ -667,7 +679,7 @@ def register_var_mean():
 
     # This signature tries to combine several overloads of the torch.var_mean function into one overload.
     nvprim.define(
-        f"{name}(Tensor inp, int[1]? dim=None, bool? unbiased=None, bool keepdim=False, *, int? correction=None)"
+        f"{name}(Tensor inp, int[1]? dim=None, bool? unbiased=None, bool keepdim=False, *, float? correction=None)"
         + " -> (Tensor, Tensor)"
     )
 
@@ -684,8 +696,10 @@ def register_var_mean():
                 inp.shape[i] if i not in dim else 1 for i in range(inp.ndim)
             ]
             broadcast_dims = [i for i in range(inp.ndim) if i not in dim]
-            var = torch.ops.nvprims.broadcast_in_dim(var, output_shape, broadcast_dims)
-            mean = torch.ops.nvprims.broadcast_in_dim(
+            var = torch._ops.ops.nvprims.broadcast_in_dim(
+                var, output_shape, broadcast_dims
+            )
+            mean = torch._ops.ops.nvprims.broadcast_in_dim(
                 mean, output_shape, broadcast_dims
             )
         return (var, mean)
@@ -698,7 +712,7 @@ def register_var_mean():
     nvprim_impl.impl(name, _prim_impl)
     nvprim_meta_impl.impl(name, _meta_var_mean)
 
-    prim_packet = torch.ops.nvprims.var_mean
+    prim_packet = torch._ops.ops.nvprims.var_mean
     prim = prim_packet.main
 
     def _unbiased_overload_impl(inp, unbiased):
@@ -729,8 +743,10 @@ def register_var_mean():
             output_shape = [a.shape[i] if i not in dim else 1 for i in range(a.ndim)]
             broadcast_dims = [i for i in range(a.ndim) if i not in dim]
             var, mean = var_mean
-            var = torch.ops.nvprims.broadcast_in_dim(var, output_shape, broadcast_dims)
-            mean = torch.ops.nvprims.broadcast_in_dim(
+            var = torch._ops.ops.nvprims.broadcast_in_dim(
+                var, output_shape, broadcast_dims
+            )
+            mean = torch._ops.ops.nvprims.broadcast_in_dim(
                 mean, output_shape, broadcast_dims
             )
             var_mean = (var, mean)
@@ -777,7 +793,7 @@ def register_view():
 
     nvprim_impl.impl(name, _prim_impl)
 
-    prim_packet = torch.ops.nvprims.view
+    prim_packet = torch._ops.ops.nvprims.view
     prim = prim_packet.default
 
     def _view_no_original_shape_overload_impl(a, shape):
@@ -805,13 +821,13 @@ def register_nvprims():
     register_full()
 
     for name in nvprim_names:
-        main_prim = getattr(torch.ops.prims, name)
+        main_prim = getattr(torch._ops.ops.prims, name)
 
         nvprim.define(main_prim.schema)
         nvprim_impl.impl(name, main_prim.prim_impl)
         nvprim_meta_impl.impl(name, main_prim.prim_meta_impl)
 
-        prim_packet = getattr(torch.ops.nvprims, name)
+        prim_packet = getattr(torch._ops.ops.nvprims, name)
         prim = prim_packet.default
 
         nvprim_autograd_impl.impl(name, backwards_not_supported(prim))

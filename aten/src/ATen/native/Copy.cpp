@@ -8,6 +8,7 @@
 #include <ATen/native/quantized/Copy.h>
 #include <ATen/native/mps/Copy.h>
 #include <ATen/native/vulkan/ops/Copy.h>
+#include <ATen/native/TensorShape.h>
 #include <ATen/quantized/Quantizer.h>
 #include <ATen/vulkan/Context.h>
 #include <ATen/metal/Context.h>
@@ -278,32 +279,6 @@ static Tensor & copy_impl(Tensor & self, const Tensor & src, bool non_blocking) 
   return self;
 }
 
-// NB: cribbed from https://github.com/pytorch/pytorch/pull/88198
-at::Tensor clone_preserve_strides(const at::Tensor& self) {
-  TORCH_INTERNAL_ASSERT(self.has_storage());
-  // In cases where the input tensor has internal memory overlap, we cannot actually
-  // preserve the strides/storage_offset of the input tensor, because
-  // *_scatter ops will try to copy_() into the cloned tensor.
-  // However, this should **never** show up in functionalized user code;
-  // most aten ops that try to mutate a tensor with internal memory overlap would error anyway.
-  //
-  // The one place that this does come up is in autograd - if there's a select_scatter
-  // in the forward, then autograd will generate one for the backward.
-  // If the input to the select_scatter is grad_output, then this could be an expanded tensor
-  // with internal overlap.
-  //if (at::has_internal_overlap(self) == at::MemOverlap::Yes) {
-  //  return self.clone();
-  //}
-  auto dtype_size = self.dtype().itemsize();
-  auto nbytes = self.storage().sym_nbytes();
-  TORCH_INTERNAL_ASSERT(nbytes % dtype_size == 0);
-  auto numel = nbytes / dtype_size;
-  auto self_full_size = self.as_strided_symint({numel}, {1}, 0);
-  auto clone = self_full_size.clone();
-  auto out = clone.as_strided_symint(self.sym_sizes(), self.sym_strides(), self.sym_storage_offset());
-  return out;
-}
-
 Tensor copy(const Tensor& self, const Tensor& src, bool non_blocking) {
   // copy() is the "functional" form of copy_(). It exists so we can properly functionalize copy_(), but:
   // (1) It isn't exposed to the frontend (no python bindings)
@@ -343,6 +318,10 @@ void copy_ignoring_overlaps(const TensorBase &dst, const TensorBase &src) {
       .check_all_same_device(true)
       .build();
   copy_stub(iter.device_type(), iter, /*non_blocking=*/false);
+}
+
+void _propagate_xla_data(const Tensor& input, const Tensor& output) {
+  TORCH_INTERNAL_ASSERT(input.device().type() == kXLA, "This op should only be called by XLA")
 }
 
 DEFINE_DISPATCH(copy_stub);

@@ -46,6 +46,7 @@
 #include <torch/csrc/Dtype.h>
 #include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/Exceptions.h>
+#include <torch/csrc/Export.h>
 #include <torch/csrc/Generator.h>
 #include <torch/csrc/Layout.h>
 #include <torch/csrc/MemoryFormat.h>
@@ -132,7 +133,7 @@ struct ParsedArgs {
   PyObject* args[N];
 };
 
-struct PythonArgParser {
+struct PYBIND11_EXPORT PythonArgParser {
   explicit PythonArgParser(
       std::vector<std::string> fmts,
       bool traceable = false);
@@ -549,7 +550,7 @@ inline std::vector<c10::SymInt> PythonArgs::symintlist(int i) {
       jit::tracer::ArgumentStash::stashIntArrayRefElem(
           signature.params[i].name, size2, idx, var);
       try {
-        res.push_back(var.item<int64_t>());
+        res.emplace_back(var.item<int64_t>());
         continue;
       } catch (std::exception& e) {
         throw_intlist_exception(this, i, obj, idx);
@@ -573,7 +574,7 @@ inline std::vector<c10::SymInt> PythonArgs::symintlist(int i) {
           if (is_symint(py::handle(obj))) {
             res.push_back(py::handle(obj).cast<c10::SymInt>());
           } else {
-            res.push_back(c10::SymInt(THPUtils_unpackIndex(obj)));
+            res.emplace_back(THPUtils_unpackIndex(obj));
           }
         } catch (std::exception& e) {
           throw_intlist_exception(this, i, obj, idx);
@@ -699,14 +700,7 @@ inline at::ScalarType PythonArgs::scalartypeWithDefault(
   return scalartype(i);
 }
 
-inline at::ScalarType PythonArgs::scalartype(int i) {
-  if (!args[i]) {
-    auto scalartype = signature.params[i].default_scalartype;
-    return (scalartype == at::ScalarType::Undefined)
-        ? torch::tensors::get_default_scalar_type()
-        : scalartype;
-  }
-  PyObject* obj = args[i];
+inline at::ScalarType toScalarType(PyObject* obj) {
   if (obj == (PyObject*)&PyFloat_Type) {
     return at::ScalarType::Double;
   }
@@ -717,6 +711,17 @@ inline at::ScalarType PythonArgs::scalartype(int i) {
     return at::ScalarType::Long;
   }
   return reinterpret_cast<THPDtype*>(obj)->scalar_type;
+}
+
+inline at::ScalarType PythonArgs::scalartype(int i) {
+  if (!args[i]) {
+    auto scalartype = signature.params[i].default_scalartype;
+    return (scalartype == at::ScalarType::Undefined)
+        ? torch::tensors::get_default_scalar_type()
+        : scalartype;
+  }
+  PyObject* obj = args[i];
+  return toScalarType(obj);
 }
 
 inline c10::optional<at::ScalarType> PythonArgs::scalartypeOptional(int i) {
@@ -893,6 +898,10 @@ inline int64_t PythonArgs::toInt64(int i) {
     jit::tracer::ArgumentStash::stashValue(
         signature.params[i].name, idx, var, c10::IntType::get());
   }
+  if (torch::is_symint(py::handle(args[i]))) {
+    return py::cast<c10::SymInt>(py::handle(args[i]))
+        .guard_int(__FILE__, __LINE__);
+  }
   return THPUtils_unpackLong(args[i]);
 }
 
@@ -944,6 +953,10 @@ inline c10::optional<double> PythonArgs::toDoubleOptional(int i) {
 inline double PythonArgs::toDouble(int i) {
   if (!args[i])
     return signature.params[i].default_double;
+  if (torch::is_symfloat(py::handle(args[i]))) {
+    return py::cast<c10::SymFloat>(py::handle(args[i]))
+        .guard_float(__FILE__, __LINE__);
+  }
   return THPUtils_unpackDouble(args[i]);
 }
 
@@ -1023,7 +1036,10 @@ inline c10::Stream PythonArgs::stream(int i) {
     throw TypeError(
         "expected Stream object. Got '%s'", Py_TYPE(args[i])->tp_name);
   }
-  return c10::Stream::unpack(((THPStream*)args[i])->cdata);
+  return c10::Stream::unpack3(
+      ((THPStream*)args[i])->stream_id,
+      ((THPStream*)args[i])->device_index,
+      static_cast<DeviceType>(((THPStream*)args[i])->device_type));
 }
 
 inline PyObject* PythonArgs::pyobject(int i) {
@@ -1116,7 +1132,7 @@ auto handle_torch_function(
 // PythonArgParser to get overloaded_args.
 enum class TorchFunctionName { TorchFunction, TorchDispatch };
 
-auto TORCH_API handle_torch_function_no_python_arg_parser(
+auto TORCH_PYTHON_API handle_torch_function_no_python_arg_parser(
     at::ArrayRef<py::handle> overloaded_args,
     PyObject* args,
     PyObject* kwargs,

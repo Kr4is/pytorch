@@ -13,9 +13,9 @@
 #include <c10/core/CPUAllocator.h>
 #include <c10/core/Backend.h>
 #include <c10/util/Exception.h>
+#include <c10/util/Logging.h>
 
 #include "caffe2/core/common.h"
-#include "caffe2/core/logging.h"
 #include "caffe2/serialize/file_adapter.h"
 #include "caffe2/serialize/inline_container.h"
 #include "caffe2/serialize/istream_adapter.h"
@@ -25,6 +25,7 @@
 
 namespace caffe2 {
 namespace serialize {
+constexpr c10::string_view kDebugPklSuffix(".debug_pkl");
 
 size_t istream_read_func(void *pOpaque, mz_uint64 file_ofs, void *pBuf, size_t n) {
   auto self = static_cast<PyTorchStreamReader*>(pOpaque);
@@ -149,8 +150,7 @@ void PyTorchStreamReader::init() {
                  version,
                  " as Long Long.");
   }
-  // NOLINTNEXTLINE(clang-diagnostic-sign-compare)
-  if (version_ < kMinSupportedFileFormatVersion) {
+  if (version_ < static_cast<decltype(version_)>(kMinSupportedFileFormatVersion)) {
     CAFFE_THROW(
         "Attempted to read a PyTorch file with version ",
         c10::to_string(version_),
@@ -160,8 +160,7 @@ void PyTorchStreamReader::init() {
         " with latest version of PyTorch to mitigate this issue.");
   }
 
-  // NOLINTNEXTLINE(clang-diagnostic-sign-compare)
-  if (version_ > kMaxSupportedFileFormatVersion) {
+  if (version_ > static_cast<decltype(version_)>(kMaxSupportedFileFormatVersion)) {
     CAFFE_THROW(
         "Attempted to read a PyTorch file with version ",
         version_,
@@ -222,6 +221,10 @@ size_t getPadding(
 
 bool PyTorchStreamReader::hasRecord(const std::string& name) {
   std::lock_guard<std::mutex> guard(reader_lock_);
+
+  if ((!load_debug_symbol_) && c10::string_view(name).ends_with(kDebugPklSuffix)) {
+    return false;
+  }
   std::string ss = archive_name_plus_slash_ + name;
   mz_zip_reader_locate_file(ar_.get(), ss.c_str(), nullptr, 0);
   const mz_zip_error err = mz_zip_get_last_error(ar_.get());
@@ -255,8 +258,11 @@ std::vector<std::string> PyTorchStreamReader::getAllRecords() {
           ": ",
           buf);
     }
-    // NOLINTNEXTLINE(modernize-use-emplace)
-    out.push_back(buf + archive_name_plus_slash_.size());
+    if ((load_debug_symbol_) ||
+        (!c10::string_view(buf + archive_name_plus_slash_.size()).ends_with(kDebugPklSuffix))) {
+      // NOLINTNEXTLINE(modernize-use-emplace)
+      out.push_back(buf + archive_name_plus_slash_.size());
+    }
   }
   return out;
 }
@@ -276,6 +282,10 @@ size_t PyTorchStreamReader::getRecordID(const std::string& name) {
 // return dataptr, size
 std::tuple<at::DataPtr, size_t> PyTorchStreamReader::getRecord(const std::string& name) {
   std::lock_guard<std::mutex> guard(reader_lock_);
+  if ((!load_debug_symbol_) && c10::string_view(name).ends_with(kDebugPklSuffix)) {
+    at::DataPtr retval;
+    return std::make_tuple(std::move(retval), 0);
+  }
   size_t key = getRecordID(name);
   mz_zip_archive_file_stat stat;
   mz_zip_reader_file_stat(ar_.get(), key, &stat);

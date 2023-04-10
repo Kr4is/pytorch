@@ -3,15 +3,12 @@ from __future__ import annotations
 
 import enum
 import typing
-from typing import Dict, Optional, Union
-
-from typing_extensions import Literal
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from torch._C import _onnx as _C_onnx
 from torch.onnx import errors
 from torch.onnx._internal import _beartype
-
 
 if typing.TYPE_CHECKING:
     # Hack to help mypy to recognize torch._C.Value
@@ -63,6 +60,8 @@ class JitScalarType(enum.IntEnum):
     Use ``JitScalarType`` to convert from torch and JIT scalar types to ONNX scalar types.
 
     Examples:
+        >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_ONNX)
+        >>> # xdoctest: +IGNORE_WANT("win32 has different output")
         >>> JitScalarType.from_value(torch.ones(1, 2)).onnx_type()
         TensorProtoDataType.FLOAT
 
@@ -336,3 +335,29 @@ _SCALAR_TYPE_TO_DTYPE = {
 }
 
 _DTYPE_TO_SCALAR_TYPE = {v: k for k, v in _SCALAR_TYPE_TO_DTYPE.items()}
+
+
+# NOTE: Belows are from torch/fx/node.py
+BaseArgumentTypes = Union[
+    str,
+    int,
+    float,
+    bool,
+    complex,
+    torch.dtype,
+    torch.Tensor,
+    torch.device,
+    torch.memory_format,
+    torch.layout,
+]
+Argument = Optional[
+    Union[
+        Tuple[Any, ...],  # actually Argument, but mypy can't represent recursive types
+        List[Any],  # actually Argument
+        Dict[str, Any],  # actually Argument
+        slice,  # Slice[Argument, Argument, Argument], but slice is not a templated type in typing
+        range,
+        "torch.fx.Node",
+        BaseArgumentTypes,
+    ]
+]

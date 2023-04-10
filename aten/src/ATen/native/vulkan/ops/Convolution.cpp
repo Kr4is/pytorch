@@ -15,6 +15,7 @@
 #else
 #include <ATen/ops/pad.h>
 #include <ATen/ops/permute.h>
+#include <ATen/ops/quantize_per_tensor.h>
 #include <ATen/ops/zeros.h>
 #endif
 
@@ -279,7 +280,7 @@ at::Tensor rearrange_bias(
 // Shader and Workgroup size determination
 //
 
-static api::ShaderSource get_shader(
+static api::ShaderInfo get_shader(
     const IntArrayRef kernel_size,
     const IntArrayRef stride,
     const IntArrayRef padding,
@@ -296,46 +297,46 @@ static api::ShaderSource get_shader(
 
     switch (method) {
       case Conv2dSlidingWindow:
-        shader = VK_SHADER(quantized_conv2d);
+        shader = VK_KERNEL(quantized_conv2d);
         break;
       case Conv2dDepthwise:
-        shader = VK_SHADER(quantized_conv2d_dw);
+        shader = VK_KERNEL(quantized_conv2d_dw);
         break;
       case Conv2dPointwise:
-        shader = VK_SHADER(quantized_conv2d_pw_2x2);
+        shader = VK_KERNEL(quantized_conv2d_pw_2x2);
         break;
         // todo fail for quantized transposed conv
     }
-    return shader.shader_src;
+    return shader;
   }
 
   if (transposed) {
-    shader = VK_SHADER(conv_transpose2d);
-    return shader.shader_src;
+    shader = VK_KERNEL(conv_transpose2d);
+    return shader;
   }
 
   switch (method) {
     case Conv2dSlidingWindow:
-      shader = VK_SHADER(conv2d);
+      shader = VK_LOOKUP_KERNEL(conv2d);
       break;
     case Conv2dDepthwise:
-      shader = VK_SHADER(conv2d_dw);
+      shader = VK_KERNEL(conv2d_dw);
       if (kernel_size.size() == 4 && kernel_size[2] == 3 &&
           kernel_size[3] == 3) {
         // 1x1 refers to the output tile size
-        shader = VK_SHADER(conv2d_dw_3x3);
+        shader = VK_KERNEL(conv2d_dw_3x3);
       }
       if (kernel_size.size() == 4 && kernel_size[2] == 5 &&
           kernel_size[3] == 5) {
         // 1x1 refers to the output tile size
-        shader = VK_SHADER(conv2d_dw_5x5);
+        shader = VK_KERNEL(conv2d_dw_5x5);
       }
       break;
     case Conv2dPointwise:
-      shader = VK_SHADER(conv2d_pw_2x2);
+      shader = VK_LOOKUP_KERNEL(conv2d_pw);
       break;
   }
-  return shader.shader_src;
+  return shader;
 }
 
 //
@@ -357,7 +358,7 @@ struct Params final {
 
 void record_op(
     api::Context* const context,
-    api::ShaderSource& compute_shader,
+    api::ShaderInfo& compute_shader,
     vTensor& v_output,
     const vTensor& v_input,
     const vTensor& v_weight,
@@ -430,7 +431,7 @@ struct QParams final {
 
 void record_quantized_op(
     api::Context* const context,
-    api::ShaderSource& compute_shader,
+    api::ShaderInfo& compute_shader,
     vTensor& v_output,
     const vTensor& v_input,
     const vTensor& v_weight,
@@ -527,7 +528,7 @@ vTensor pack_weights(
   vTensor v_weight{
       api::context(),
       weight_rearranged.sizes(),
-      weight_arg.options(),
+      weight_arg.scalar_type(),
       quantized ? api::StorageType::TEXTURE_3D : api::StorageType::TEXTURE_2D,
   };
 
@@ -552,11 +553,11 @@ vTensor pack_biases(
   vTensor v_bias{
       api::context(),
       bias_rearranged.sizes(),
-      bias_rearranged.options(),
+      bias_rearranged.scalar_type(),
       quantized ? api::StorageType::TEXTURE_3D : api::StorageType::TEXTURE_2D,
   };
 
-  if (quantized) {
+  if (quantized && bias->scalar_type() != c10::kFloat) {
     v_bias.set_is_quantized();
     v_bias.set_scale(bias_rearranged.q_scale());
     v_bias.set_zero_point(bias_rearranged.q_zero_point());
@@ -1000,6 +1001,28 @@ c10::intrusive_ptr<Conv2dPackedContext> create_qconv2d_context(
       output_max));
 }
 
+c10::intrusive_ptr<Conv2dPackedContext> convert_qconv2d_context(
+    const c10::intrusive_ptr<ConvPackedParamsBase<2>>& packed_params,
+    const c10::optional<Scalar>& output_min,
+    const c10::optional<Scalar>& output_max) {
+  std::tuple<Tensor, c10::optional<Tensor>> wb = packed_params->unpack();
+  Tensor weight = std::get<0>(wb);
+  c10::optional<Tensor> bias = std::get<1>(wb);
+
+  return c10::make_intrusive<Conv2dPackedContext>(Conv2dPackedContext(
+      weight,
+      bias,
+      packed_params->stride().vec(),
+      packed_params->padding().vec(),
+      packed_params->dilation().vec(),
+      /* transposed = */ false,
+      /* quantized = */ true,
+      /* output_padding_arg = */ {0},
+      packed_params->groups(),
+      output_min,
+      output_max));
+}
+
 Tensor run_conv2d_context_impl(
     const Tensor& input_arg,
     const c10::intrusive_ptr<Conv2dPackedContext>& conv_context,
@@ -1012,11 +1035,22 @@ Tensor run_conv2d_context_impl(
   const vTensor& v_input = convert(input_arg);
 
   // Extract everything from the PackedContext
-  const vTensor& v_weight = convert(
-      conv_context->get_val(Conv2dPackedContext::Packed::Weight).toTensor());
+  const Tensor weight =
+      conv_context->get_val(Conv2dPackedContext::Packed::Weight).toTensor();
+  const vTensor& v_weight = convert(weight);
 
-  const vTensor& v_bias = convert(
-      conv_context->get_val(Conv2dPackedContext::Packed::Bias).toTensor());
+  const auto quantized =
+      conv_context->get_val(Conv2dPackedContext::Packed::isQuantized).toBool();
+
+  Tensor bias =
+      conv_context->get_val(Conv2dPackedContext::Packed::Bias).toTensor();
+  if (quantized && bias.scalar_type() == c10::kFloat) {
+    bias = at::quantize_per_tensor(
+        bias, v_weight.get_scale() * v_input.get_scale(), 0, c10::kQInt32);
+    conv_context->set_val(Conv2dPackedContext::Packed::Bias, bias);
+  }
+
+  const vTensor& v_bias = convert(bias);
 
   const auto overlay_region =
       conv_context->get_val(Conv2dPackedContext::Packed::OverlayRegion)
@@ -1035,8 +1069,6 @@ Tensor run_conv2d_context_impl(
 
   const auto transposed =
       conv_context->get_val(Conv2dPackedContext::Packed::isTransposed).toBool();
-  const auto quantized =
-      conv_context->get_val(Conv2dPackedContext::Packed::isQuantized).toBool();
 
   const float output_min = safe_downcast<float>(
       conv_context->get_val(Conv2dPackedContext::Packed::OutputMin).toDouble());
@@ -1070,7 +1102,7 @@ Tensor run_conv2d_context_impl(
   vTensor v_output{
       context,
       output_size,
-      input_arg.options(),
+      input_arg.scalar_type(),
   };
 
   if (quantized) {

@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.distributed._composable.contract import contract
 from torch.distributed._composable_state import _get_module_state, _insert_module_state
 from torch.distributed.fsdp._common_utils import _FSDPState
+
 from torch.distributed.fsdp._init_utils import (
     _init_buffer_state,
     _init_core_state,
@@ -44,10 +45,12 @@ def fully_shard(
     device_id: Optional[Union[int, torch.device]] = None,
     param_init_fn: Optional[Callable[[nn.Module], None]] = None,
     sync_module_states: bool = False,
+    forward_prefetch: bool = False,
 ) -> nn.Module:
     """
     Applies ``FullyShardedDataParallel` (FSDP) semantics to ``module``.
     """
+    torch._C._log_api_usage_once("torch.distributed.fully_shard")
     # Enforce the new auto wrap policy
     if policy is not None and not isinstance(policy, _FSDPPolicy):
         raise ValueError(f"Expects an `_FSDPPolicy` but got {policy}")
@@ -71,7 +74,9 @@ def fully_shard(
         forward_prefetch_limit,
     )
     state = _init_runtime_state(state)
-    state = _init_prefetching_state(state, BackwardPrefetch.BACKWARD_PRE, False)
+    state = _init_prefetching_state(
+        state, BackwardPrefetch.BACKWARD_PRE, forward_prefetch=forward_prefetch
+    )
     state = _init_buffer_state(state, module)
     state = _init_param_handles_from_module(
         state,

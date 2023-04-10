@@ -48,7 +48,7 @@ c10::optional<TypePtr> subtractTypeSetFrom(std::vector<TypePtr>& to_subtract, Ar
                 return !should_subtract(t);
               });
 
-  if (types.size() == 0) {
+  if (types.empty()) {
     return c10::nullopt;
   } else if (types.size() == 1) {
     return types[0];
@@ -162,7 +162,7 @@ void standardizeVectorForUnion(std::vector<TypePtr>* to_flatten) {
                         "passed a `nullptr`");
   std::vector<TypePtr> to_fill;
   standardizeVectorForUnion(*to_flatten, &to_fill);
-  *to_flatten = to_fill;
+  *to_flatten = std::move(to_fill);
 }
 
 OptionalType::OptionalType(TypePtr contained)
@@ -179,8 +179,8 @@ OptionalType::OptionalType(TypePtr contained)
   } else if (contained == NumberType::get() || is_numbertype) {
     contained_ = NumberType::get();
     types_.clear();
-    types_.push_back(NumberType::get());
-    types_.push_back(NoneType::get());
+    types_.emplace_back(NumberType::get());
+    types_.emplace_back(NoneType::get());
   } else {
     std::vector<TypePtr> to_subtract{NoneType::get()};
     auto without_none = subtractTypeSetFrom(to_subtract, types_);

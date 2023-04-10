@@ -40,6 +40,7 @@ jobs:
     if: github.repository_owner == 'pytorch'
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - docs_type: cpp
@@ -95,6 +96,8 @@ jobs:
         env:
           GITHUB_PYTORCHBOT_TOKEN: ${{ secrets.GH_PYTORCHBOT_TOKEN }}
         run: |
+          # sometimes .netrc exists as a directory even though this is the temp folder
+          rm -rf "${RUNNER_TEMP}/.netrc"
           # set credentials for https pushing
           echo "machine github.com" > "${RUNNER_TEMP}/.netrc"
           echo "login pytorchbot" >> "${RUNNER_TEMP}/.netrc"
@@ -175,6 +178,41 @@ jobs:
           if-no-files-found: error
           path: functorch_ghpages/nightly/
           s3-prefix: pytorch/${{ github.event.pull_request.number }}/functorchdocs
+
+      # The three upload steps below duplicate the upload from above, but to a different path. This is needed since we
+      # are in the process of changing the path, but want to keep the disruption to a minimum.
+      # See https://github.com/pytorch/test-infra/issues/3894
+      # After a grace period the s3-prefix should start with pytorch/pytorch/
+      - name: Upload Python Docs Preview (forward compatibility)
+        uses: seemethere/upload-artifact-s3@v5
+        if: ${{ github.event_name == 'pull_request' && matrix.docs_type == 'python' && steps.build-docs.outcome == 'success' }}
+        with:
+          retention-days: 14
+          s3-bucket: doc-previews
+          if-no-files-found: error
+          path: pytorch.github.io/docs/master/
+          s3-prefix: pytorch/pytorch/pytorch/${{ github.event.pull_request.number }}
+
+      - name: Upload C++ Docs Preview (forward compatibility)
+        uses: seemethere/upload-artifact-s3@v5
+        if: ${{ github.event_name == 'pull_request' && matrix.docs_type == 'cpp' && steps.build-docs.outcome == 'success' }}
+        with:
+          retention-days: 14
+          if-no-files-found: error
+          s3-bucket: doc-previews
+          path: cppdocs/
+          s3-prefix: pytorch/pytorch/pytorch/${{ github.event.pull_request.number }}/cppdocs
+
+      - name: Upload functorch Docs Preview (forward compatibility)
+        uses: seemethere/upload-artifact-s3@v5
+        if: ${{ github.event_name == 'pull_request' && matrix.docs_type == 'functorch' && steps.build-docs.outcome == 'success' }}
+        with:
+          retention-days: 14
+          s3-bucket: doc-previews
+          if-no-files-found: error
+          path: functorch_ghpages/nightly/
+          s3-prefix: pytorch/pytorch/pytorch/${{ github.event.pull_request.number }}/functorchdocs
+
       - name: Teardown Linux
         uses: pytorch/test-infra/.github/actions/teardown-linux@main
         if: always()

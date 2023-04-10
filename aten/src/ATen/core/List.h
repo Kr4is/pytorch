@@ -24,9 +24,7 @@ namespace detail {
 struct ListImpl final : public c10::intrusive_ptr_target {
   using list_type = std::vector<IValue>;
 
-  explicit ListImpl(list_type list_, TypePtr elementType_)
-  : list(std::move(list_))
-  , elementType(std::move(elementType_)) {}
+  explicit TORCH_API ListImpl(list_type list_, TypePtr elementType_);
 
   list_type list;
 
@@ -88,12 +86,12 @@ public:
 
   friend void swap<T, Iterator>(ListElementReference&& lhs, ListElementReference&& rhs);
 
+  ListElementReference(const ListElementReference&) = delete;
+  ListElementReference& operator=(const ListElementReference&) = delete;
+
 private:
   ListElementReference(Iterator iter)
   : iterator_(iter) {}
-
-  ListElementReference(const ListElementReference&) = delete;
-  ListElementReference& operator=(const ListElementReference&) = delete;
 
   // allow moving, but only our friends (i.e. the List class) can move us
   ListElementReference(ListElementReference&&) noexcept = default;
@@ -480,9 +478,7 @@ namespace impl {
 // (maybe except for some internal prim ops).
 using GenericList = List<IValue>;
 
-inline const IValue* ptr_to_first_element(const GenericList& list) {
-  return &list.impl_->list[0];
-}
+const IValue* ptr_to_first_element(const GenericList& list);
 
 }
 }

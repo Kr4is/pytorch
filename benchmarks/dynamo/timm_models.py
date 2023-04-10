@@ -11,7 +11,7 @@ import warnings
 import torch
 from common import BenchmarkRunner, main
 
-from torch._dynamo.testing import collect_results
+from torch._dynamo.testing import collect_results, reduce_to_scalar_loss
 from torch._dynamo.utils import clone_inputs
 
 
@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     print("Installing Pytorch Image Models...")
     pip_install("git+https://github.com/rwightman/pytorch-image-models")
 finally:
+    from timm import __version__ as timmversion
     from timm.data import resolve_data_config
     from timm.models import create_model
 
@@ -74,9 +75,26 @@ SKIP = {
     "levit_128",
 }
 
+SKIP_TRAIN = {
+    # segfault: Internal Triton PTX codegen error
+    "eca_halonext26ts",
+}
+
+NONDETERMINISTIC = {
+    # https://github.com/pytorch/pytorch/issues/94066
+    "sebotnet33ts_256",
+}
 
 MAX_BATCH_SIZE_FOR_ACCURACY_CHECK = {
     "cait_m36_384": 4,
+}
+
+SCALED_COMPUTE_LOSS = {
+    "ese_vovnet19b_dw",
+    "fbnetc_100",
+    "mnasnet_100",
+    "mobilevit_s",
+    "sebotnet33ts_256",
 }
 
 
@@ -168,7 +186,7 @@ def refresh_model_names():
 
 class TimmRunnner(BenchmarkRunner):
     def __init__(self):
-        super(TimmRunnner, self).__init__()
+        super().__init__()
         self.suite_name = "timm_models"
 
     def load_model(
@@ -177,16 +195,17 @@ class TimmRunnner(BenchmarkRunner):
         model_name,
         batch_size=None,
     ):
-
         is_training = self.args.training
         use_eval_mode = self.args.use_eval_mode
 
         # _, model_dtype, data_dtype = self.resolve_precision()
         channels_last = self._args.channels_last
 
-        retries = 1
+        tries = 1
         success = False
-        while not success and retries < 4:
+        model = None
+        total_allowed_tries = 5
+        while not success and tries <= total_allowed_tries:
             try:
                 model = create_model(
                     model_name,
@@ -204,10 +223,17 @@ class TimmRunnner(BenchmarkRunner):
                     # drop_block_rate=kwargs.pop('drop_block', None),
                 )
                 success = True
-            except Exception:
-                wait = retries * 30
-                time.sleep(wait)
-                retries += 1
+            except Exception as e:
+                tries += 1
+                if tries <= total_allowed_tries:
+                    wait = tries * 30
+                    print(
+                        f"Failed to load model: {e}. Trying again ({tries}/{total_allowed_tries}) after {wait}s"
+                    )
+                    time.sleep(wait)
+
+        if model is None:
+            raise RuntimeError(f"Failed to load model '{model_name}'")
 
         model.to(
             device=device,
@@ -217,7 +243,9 @@ class TimmRunnner(BenchmarkRunner):
         self.num_classes = model.num_classes
 
         data_config = resolve_data_config(
-            self._args, model=model, use_test_size=not is_training
+            vars(self._args) if timmversion >= "0.8.0" else self._args,
+            model=model,
+            use_test_size=not is_training,
         )
         input_size = data_config["input_size"]
         recorded_batch_size = TIMM_MODELS[model_name]
@@ -253,12 +281,14 @@ class TimmRunnner(BenchmarkRunner):
         self.target = self._gen_target(batch_size, device)
 
         self.loss = torch.nn.CrossEntropyLoss().to(device)
+
+        if model_name in SCALED_COMPUTE_LOSS:
+            self.compute_loss = self.scaled_compute_loss
+
         if is_training and not use_eval_mode:
             model.train()
         else:
             model.eval()
-
-        self.init_optimizer(device, model.parameters())
 
         self.validate_model(model, example_inputs)
 
@@ -274,6 +304,7 @@ class TimmRunnner(BenchmarkRunner):
             if (
                 not re.search("|".join(args.filter), model_name, re.I)
                 or re.search("|".join(args.exclude), model_name, re.I)
+                or model_name in args.exclude_exact
                 or model_name in self.skip_models
             ):
                 continue
@@ -305,10 +336,15 @@ class TimmRunnner(BenchmarkRunner):
     def compute_loss(self, pred):
         # High loss values make gradient checking harder, as small changes in
         # accumulation order upsets accuracy checks.
-        return self.loss(pred, self.target) / 10.0
+        return reduce_to_scalar_loss(pred)
+
+    def scaled_compute_loss(self, pred):
+        # Loss values need zoom out further.
+        return reduce_to_scalar_loss(pred) / 1000.0
 
     def forward_pass(self, mod, inputs, collect_outputs=True):
-        return mod(*inputs)
+        with self.autocast():
+            return mod(*inputs)
 
     def forward_and_backward_pass(self, mod, inputs, collect_outputs=True):
         cloned_inputs = clone_inputs(inputs)
@@ -325,7 +361,11 @@ class TimmRunnner(BenchmarkRunner):
         return None
 
 
-if __name__ == "__main__":
+def timm_main():
     logging.basicConfig(level=logging.WARNING)
     warnings.filterwarnings("ignore")
     main(TimmRunnner())
+
+
+if __name__ == "__main__":
+    timm_main()

@@ -647,7 +647,7 @@ IValue parseObject(
       mobile::Function* setstate = loader.getFunction(object->setstate_func());
       auto obj =
           c10::ivalue::Object::create(at::StrongTypePtr(loader.cu_, cls), 0);
-      stack.push_back(obj);
+      stack.emplace_back(obj);
       stack.emplace_back(std::move(input));
       setstate->run(stack);
       return obj;
@@ -658,7 +658,7 @@ IValue parseObject(
       IValue input = loader.getIValue(object->state());
       auto obj = c10::ivalue::Object::create(
           c10::StrongTypePtr(nullptr, custom_class_type), 1);
-      stack.push_back(obj);
+      stack.emplace_back(obj);
       stack.emplace_back(std::move(input));
       custom_class_type->getMethod("__setstate__").run(stack);
       return obj;
@@ -733,7 +733,7 @@ void FlatbufferLoader::extractJitSourceAndConstants(
     }
   }
   const auto* jit_constants = module_->jit_constants();
-  for (auto i = 0; i < jit_constants->size(); ++i) {
+  for (const auto i : c10::irange(jit_constants->size())) {
     constants->emplace_back(getIValue(jit_constants->Get(i)));
   }
   parseExtraFilesFromVector(module_->jit_sources(), jit_sources);

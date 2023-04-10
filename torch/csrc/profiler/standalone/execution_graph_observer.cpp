@@ -164,7 +164,7 @@ struct TORCH_API ExecutionGraphObserver {
   std::map<size_t, std::stack<ID>> op_stack{};
   // Uses the underlying TensorImpl object pointer as the key and map to its
   // unique id.
-  std::map<void*, ID> object_id{};
+  std::map<const void*, ID> object_id{};
   // Observer run state.
   enum class RunState { uninitialized, disabled, enabled };
 
@@ -362,7 +362,7 @@ void finalizeExecutionGraphOutput(ExecutionGraphObserver& ob) {
 
 inline ExecutionGraphObserver::ID getObjectID(
     ExecutionGraphObserver& ob,
-    void* t) {
+    const void* t) {
   auto iter = ob.object_id.find(t);
   if (iter == ob.object_id.end()) {
     ExecutionGraphObserver::ID object_id = ob.getNewID();
@@ -517,26 +517,26 @@ std::unique_ptr<ObserverContext> onFunctionEnter(const RecordFunction& fn) {
 
 inline std::string json_str_escape(const std::string& str) {
   std::ostringstream ostream;
-  for (auto ch = str.cbegin(); ch != str.cend(); ch++) {
-    if (*ch == '"') {
+  for (char ch : str) {
+    if (ch == '"') {
       ostream << "\\\"";
-    } else if (*ch == '\\') {
+    } else if (ch == '\\') {
       ostream << "\\\\";
-    } else if (*ch == '\b') {
+    } else if (ch == '\b') {
       ostream << "\\b";
-    } else if (*ch == '\f') {
+    } else if (ch == '\f') {
       ostream << "\\f";
-    } else if (*ch == '\n') {
+    } else if (ch == '\n') {
       ostream << "\\n";
-    } else if (*ch == '\r') {
+    } else if (ch == '\r') {
       ostream << "\\r";
-    } else if (*ch == '\t') {
+    } else if (ch == '\t') {
       ostream << "\\t";
-    } else if ('\x00' <= *ch && *ch <= '\x1f') {
+    } else if ('\x00' <= ch && ch <= '\x1f') {
       ostream << "\\u" << std::hex << std::setw(4) << std::setfill('0')
-              << static_cast<int>(*ch);
+              << static_cast<int>(ch);
     } else {
-      ostream << *ch;
+      ostream << ch;
     }
   }
   return ostream.str();

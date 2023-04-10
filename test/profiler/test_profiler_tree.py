@@ -26,7 +26,7 @@ PRUNE_FUNCTIONS = {
     "torch/profiler/profiler.py(...): start": KEEP_ELLIPSES,
     "torch/profiler/profiler.py(...): stop_trace": KEEP_ELLIPSES,
     "torch/profiler/profiler.py(...): _transit_action": KEEP_ELLIPSES,
-    "<built-in method __exit__ of torch._C.DisableTorchFunction object at 0xXXXXXXXXXXXX>": PRUNE_ALL,
+    "<built-in method __exit__ of torch._C.DisableTorchFunctionSubclass object at 0xXXXXXXXXXXXX>": PRUNE_ALL,
     "cudaStreamIsCapturing": PRUNE_ALL,
     "cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags": PRUNE_ALL,
 }
@@ -129,6 +129,10 @@ class ProfilerTree:
 
         # Profiler inserts a `cudaDeviceSynchronize` at the end of profiling.
         if flat_nodes and flat_nodes[-1][1] == "cudaDeviceSynchronize":
+            flat_nodes = flat_nodes[:-1]
+
+        # Profiler inserts a `hipDeviceSynchronize` at the end of profiling.
+        if flat_nodes and flat_nodes[-1][1] == "hipDeviceSynchronize":
             flat_nodes = flat_nodes[:-1]
 
         min_depth = min([d + 1 for d, name in flat_nodes if "begin_unit_test_marker" in name] or [0])

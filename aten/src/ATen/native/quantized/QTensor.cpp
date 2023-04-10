@@ -8,6 +8,7 @@
 
 #include <c10/util/irange.h>
 
+#include <cmath>
 #include <utility>
 
 namespace at {
@@ -231,7 +232,7 @@ bool equal_quantized_cpu(const Tensor& self, const Tensor& other) {
   TORCH_CHECK(
       self.device().type() == kCPU && other.device().type() == kCPU,
       "quantized_equal is implemented only for the QuantizedCPU backend");
-  if (!other.is_quantized()) {
+  if (!self.is_quantized() || !other.is_quantized()) {
     return false;
   }
 
@@ -312,7 +313,7 @@ float calculate_quant_loss(
   // remainder loop
   for (; i < numel; i++) {
     q_input[i] = std::max(
-        0.0f, std::min<float>(nearbyint((input[i] - xmin) * inverse_scale), qmax));
+        0.0f, std::min<float>(std::nearbyint((input[i] - xmin) * inverse_scale), qmax));
     q_input[i] = q_input[i] * scale + xmin;
     norm += (input[i] - q_input[i]) * (input[i] - q_input[i]);
   }

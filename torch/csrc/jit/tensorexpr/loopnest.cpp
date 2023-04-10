@@ -5,6 +5,7 @@
 #include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <c10/util/Logging.h>
@@ -30,9 +31,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace torch {
-namespace jit {
-namespace tensorexpr {
+namespace torch::jit::tensorexpr {
 
 LoopNest::LoopNest(const LoopNest& other)
     : root_stmt_(Stmt::clone(other.root_stmt_)),
@@ -42,7 +41,7 @@ LoopNest::LoopNest(const LoopNest& other)
 }
 
 LoopNest::LoopNest(StmtPtr stmt, std::unordered_set<BufPtr> output_bufs)
-    : root_stmt_(stmt), output_bufs_(std::move(output_bufs)) {
+    : root_stmt_(std::move(stmt)), output_bufs_(std::move(output_bufs)) {
   GRAPH_DEBUG("Origin Stmt in LoopNest:\n", std::to_string(root_stmt_));
   verify(root_stmt_);
 }
@@ -657,8 +656,8 @@ class FunctionInliner : public IRMutator {
   FunctionInliner(StorePtr producer, std::unordered_set<BufPtr> outputs)
       : buf_(producer->buf()),
         producer_(producer),
-        outputs_(std::move(outputs)) {
-    success_ = true;
+        outputs_(std::move(outputs)),
+        success_(true) {
     for (const auto& i : producer->indices()) {
       if (auto index_var = to<Var>(i)) {
         index_vars_.insert(index_var);
@@ -814,7 +813,7 @@ class FunctionInliner : public IRMutator {
     }
   }
 
-  // Any Random Instrinsics that were turned into vars must be inserted here.
+  // Any Random Intrinsics that were turned into vars must be inserted here.
   StmtPtr mutate(BlockPtr v) override {
     if (!success()) {
       return v;
@@ -1223,7 +1222,7 @@ namespace {
 class IfThenElseReplacer : public IRCloner {
  public:
   IfThenElseReplacer(IfThenElsePtr to_replace, ExprPtr new_expr)
-      : to_replace_(to_replace), new_expr_(new_expr) {}
+      : to_replace_(std::move(to_replace)), new_expr_(std::move(new_expr)) {}
 
   ExprPtr mutate(IfThenElsePtr i) override {
     if (i == to_replace_) {
@@ -1355,7 +1354,7 @@ bool LoopNest::optimizeConditionals() {
       continue;
     }
     TORCH_INTERNAL_ASSERT(
-        comp_values.size() >= 1,
+        !comp_values.empty(),
         buildErrorMessage(
             "Expected at least one expression in optimizeConditional in the fuser."));
     comp_values.insert(comp_values.begin(), immLike(comp_values[0], 0));
@@ -1435,7 +1434,7 @@ void LoopNest::vectorizeInnerLoops() {
     worklist.push_back(rootF);
   } else if (BlockPtr body = to<Block>(root_stmt_)) {
     std::vector<BlockPtr> blocks = {body};
-    while (blocks.size()) {
+    while (!blocks.empty()) {
       BlockPtr b = blocks.back();
       blocks.pop_back();
 
@@ -1451,7 +1450,7 @@ void LoopNest::vectorizeInnerLoops() {
 
   // Traverse the For loop nest find inner-most loops, which are
   // vectorization candidates.
-  while (worklist.size()) {
+  while (!worklist.empty()) {
     ForPtr f = worklist.back();
     worklist.pop_back();
 
@@ -2486,7 +2485,7 @@ bool LoopNest::flatten(const std::vector<ForPtr>& loops, ForPtr* flattened) {
     auto curr_loop = normalized_loops[idx];
     ExprPtr div = alloc<Div>(flat_var, stop);
     ExprPtr sub_expr = idx == 0 ? div : alloc<Mod>(div, curr_loop->stop());
-    var_mapping.push_back(std::make_pair(curr_loop->var(), sub_expr));
+    var_mapping.emplace_back(curr_loop->var(), sub_expr);
     stop = alloc<Mul>(curr_loop->stop(), stop);
   }
   auto flattened_body =
@@ -2757,7 +2756,9 @@ class LoopComputeAtRewriter : public IRMutator {
       BufPtr buf,
       BufPtr new_buf,
       std::vector<ExprPtr> offsets)
-      : buf_(buf), new_buf_(new_buf), offsets_(std::move(offsets)) {}
+      : buf_(std::move(buf)),
+        new_buf_(std::move(new_buf)),
+        offsets_(std::move(offsets)) {}
 
  private:
   BufPtr buf_;
@@ -2806,7 +2807,7 @@ static std::vector<VarPtr> getOuterLoopIndexes(StmtPtr s) {
 class CacheReplacer : public IRMutator {
  public:
   CacheReplacer(BufPtr buffer, BufPtr cache, std::vector<ExprPtr>& offsets)
-      : buf_(buffer), cache_(cache), offsets_(offsets) {}
+      : buf_(std::move(buffer)), cache_(std::move(cache)), offsets_(offsets) {}
 
  private:
   ExprPtr mutate(LoadPtr v) override {
@@ -2929,7 +2930,7 @@ LoopNest::AccessResult LoopNest::cacheAccesses(
     tmp_params.push_back(alloc<Add>(new_loop_vars[i], info.start[i]));
   }
 
-  // Replace acceses to the producer in the consumer with the cache.
+  // Replace accesses to the producer in the consumer with the cache.
   CacheReplacer replacer(producer, tmp_buf, info.start);
   consumer->accept_mutator(&replacer);
 
@@ -3197,8 +3198,8 @@ void LoopNest::computeAt(StmtPtr s, ForPtr f) {
   }
 
   for (const auto i : c10::irange(prod_indices.size())) {
-    rewrite_indices_map.push_back(
-        {prod_indices[i], alloc<Add>(temp_indices[i], offsets[i])});
+    rewrite_indices_map.emplace_back(
+        prod_indices[i], alloc<Add>(temp_indices[i], offsets[i]));
   }
 
   // Construct the temp statement
@@ -3238,10 +3239,10 @@ class RfactorStoreRewriter : public IRMutator {
       const std::vector<ExprPtr>& old_indices,
       BufPtr new_buf,
       VarPtr reduction_var)
-      : old_buf_(old_buf),
+      : old_buf_(std::move(old_buf)),
         old_indices_(old_indices),
-        new_buf_(new_buf),
-        reduction_var_(reduction_var),
+        new_buf_(std::move(new_buf)),
+        reduction_var_(std::move(reduction_var)),
         new_indices_(old_indices) {
     new_indices_.push_back(reduction_var_);
   }
@@ -3425,6 +3426,4 @@ bool LoopNest::rfactor(
   return true;
 }
 
-} // namespace tensorexpr
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::tensorexpr

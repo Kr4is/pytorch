@@ -132,6 +132,10 @@ struct TORCH_API OperandInfo {
 
   C10_ALWAYS_INLINE ~OperandInfo() = default;
 
+  /// The data pointer. This may be different from tensor->data_ptr() if the
+  /// iterator is split.
+  void* data = nullptr;
+
   /// Stride after broadcasting. The stride is in bytes, not number of elements.
   StrideVector stride_bytes;
 
@@ -159,10 +163,6 @@ struct TORCH_API OperandInfo {
   TensorOptions options() const {
     return TensorOptions(target_dtype).device(device);
   }
-
-  /// The data pointer. This may be different from tensor->data_ptr() if the
-  /// iterator is split.
-  void* data = nullptr;
 
   bool is_output = false;
 
@@ -738,7 +738,7 @@ class TORCH_API TensorIteratorConfig final {
   friend struct TensorIteratorBase;
   friend struct TensorIterator;
 
-  TensorIteratorConfig() {}
+  TensorIteratorConfig() = default;
 
   C10_DISABLE_COPY_AND_ASSIGN(TensorIteratorConfig);
 
@@ -936,7 +936,7 @@ class TORCH_API TensorIteratorConfig final {
 /// the original TensorIterator.
 struct TORCH_API SplitUntil32Bit {
   struct TORCH_API iterator {
-    iterator(){};
+    iterator() = default;
     iterator(const TensorIteratorBase& iter);
     iterator(iterator&&) = default;
 
